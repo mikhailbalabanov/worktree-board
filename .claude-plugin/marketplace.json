@@ -1,0 +1,17 @@
+{
+  "name": "worktree-board",
+  "owner": {
+    "name": "Mikhail Balabanov",
+    "url": "https://github.com/mikhailbalabanov"
+  },
+  "metadata": {
+    "description": "The worktree-board mod for Claude Code."
+  },
+  "plugins": [
+    {
+      "name": "worktree-board",
+      "source": "./",
+      "description": "Where each Claude Code window of the repository works: the git worktree it is in, what it is doing and its last hour."
+    }
+  ]
+}
