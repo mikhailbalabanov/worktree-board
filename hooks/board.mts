@@ -1,7 +1,7 @@
 import type { Board, Card, State, Window } from '../types'
 
 export type Worktree = { path: string; branch: string; isMain: boolean; createdAt?: number; uncommitted?: number }
-export type Listed = { id: string; name: string; status: string; cwd: string; jobId?: string }
+export type Listed = { id: string; name: string; status: string; cwd: string; pid?: number; jobId?: string }
 export type Reading = { cwd?: string; title?: string; doing?: string; toolTimes: number[] }
 export type Seen = {
   id: string
@@ -55,7 +55,7 @@ export function parseSessions(json: string): Listed[] | undefined {
     if (!isRecord(row) || typeof row.sessionId !== 'string' || typeof row.cwd !== 'string') return []
     const status = typeof row.status === 'string' ? row.status : typeof row.state === 'string' ? row.state : ''
     const name = typeof row.name === 'string' ? row.name : row.sessionId
-    const listed: Listed = { id: row.sessionId, name, status, cwd: row.cwd }
+    const listed: Listed = { id: row.sessionId, name, status, cwd: row.cwd, ...(typeof row.pid === 'number' && { pid: row.pid }) }
     return [row.kind === 'background' && typeof row.id === 'string' ? { ...listed, jobId: row.id } : listed]
   })
   return rows.length > 0 && listed.length === 0 ? undefined : listed
@@ -251,41 +251,29 @@ export function idleNote(card: Card, now: number): string | undefined {
 }
 
 const MARK: Record<State, string> = { 'needs you': '🔴', working: '🟢', waiting: '🟡', idle: '⚪' }
-const cell = (text: string) => text.replaceAll('|', '\\|').replace(/[\r\n]+/g, ' ')
+// One line each, and a lone backtick cannot pair with a sparkline's code span.
+const line = (text: string) => text.replace(/[\r\n]+/g, ' ').replaceAll('`', '\\`')
 
-// The editor draws no pane and renders a command's text as Markdown, where only the rows of
-// one table share a width: the whole board is one table, a worktree's windows indented
-// under it with em spaces, which neither Markdown nor plain text collapses.
-const INDENT = '\u2003\u2003'
-
+// Printed where no pane is drawn, the editor and the phone alike: a line per window, so a
+// narrow screen wraps lines rather than squeezing a table's columns.
 export function boardText(board: Board): string {
   if (board.worktrees === 0) return board.note ?? ''
   const now = board.takenAt
-  const n = counts(board)
-  const tally = (['needs you', 'working', 'waiting'] as const).filter(state => n[state] > 0).map(state => `${MARK[state]} ${n[state]} ${state}`)
-  if (board.empty.length > 0) tally.push(`⚪ ${board.empty.length} without a window`)
-  const rows: string[] = []
-  const row = (a: string, b: string) => rows.push(`| ${a} | ${b} |`)
-  const windowRow = (w: Window) => row(`${INDENT}${MARK[w.state]} **${cell(w.name)}** · ${w.state}${w.activeAt === undefined ? '' : ` · ${age(now - w.activeAt)}`}`, cell(w.doing ?? ''))
-  if (board.cards.length + board.empty.length > 0) row('**WORKTREES**', 'a separate folder and branch for each task')
-  for (const card of board.cards) {
-    const f = facts(card, now)
-    row(`**${cell(card.name)}**`, `**${cell([f.branch, f.changes, f.added].filter(Boolean).join(' · '))}**`)
-    card.windows.forEach(windowRow)
-  }
-  if (board.empty.length > 0) {
-    row('**Without a window**', `**${plural(board.empty.length, 'worktree')}**`)
-    for (const c of board.empty) row(`${INDENT}⚪ ${cell(c.name)}`, [facts(c, now).changes, c.createdAt === undefined ? undefined : age(now - c.createdAt)].filter(Boolean).join(' · '))
-  }
-  if (board.main) {
-    row('**MAIN CHECKOUT**', 'windows working in the repository folder itself')
-    row(`**${cell(board.main.name)}**`, `**${plural(board.main.windows.length, 'window')} · branch ${cell(board.main.branch)}**`)
-    board.main.windows.filter(w => w.state !== 'idle').forEach(windowRow)
-    const idle = idleNote(board.main, now)
-    if (idle) row(`${INDENT}⚪ ${idle}`, '')
-  }
-  const out = [[board.repo, plural(board.worktrees, 'worktree')].filter(Boolean).join(' · '), '', tally.join(' · ')]
-  if (rows.length > 0) out.push('', rows[0] ?? '', '| :-- | :-- |', ...rows.slice(1))
+  const placed = [...board.cards, ...(board.main ? [board.main] : [])].flatMap(card => card.windows.map(w => ({ w, folder: `📁 ${card.isMain ? 'main checkout' : card.name}` })))
+  const rows = placed
+    .filter(({ w }) => w.state !== 'idle')
+    .sort((a, b) => byUrgency(a.w, b.w))
+    .map(({ w, folder }) => {
+      const since = w.activeAt === undefined ? undefined : age(now - w.activeAt)
+      const bars = w.state === 'working' && w.pulse.some(v => v > 0) ? ` \`${pulseText(w.pulse)}\`` : ''
+      const about = w.state === 'needs you' ? [w.doing, folder, since] : w.state === 'working' ? [folder] : [since, folder]
+      return `- ${MARK[w.state]} **${line(w.name)}**${bars} · ${about.flatMap(text => (text ? [line(text)] : [])).join(' · ')}`
+    })
+  const idle = placed.length - rows.length
+  const folded = [idle > 0 && plural(idle, 'idle window'), board.empty.length > 0 && `${plural(board.empty.length, 'worktree')} without a window`].filter(Boolean)
+  if (folded.length > 0) rows.push(`- ⚪ ${folded.join(' · ')}`)
+  const out = [[board.repo, plural(board.worktrees, 'worktree')].filter(Boolean).join(' · ')]
+  if (rows.length > 0) out.push('', ...rows)
   if (board.note) out.push('', board.note)
   return out.join('\n')
 }

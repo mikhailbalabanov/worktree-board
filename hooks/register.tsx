@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { ElementTable, EngineInterface, Register, RenderChildren, Timer } from 'claude-code'
+import type { ElementTable, EngineInterface, HookStream, ProcessSpawnChunk, ProcessSpawnResult, Register, RenderChildren, Timer } from 'claude-code'
 
 import type { Board, Card, Folds, State, Window } from '../types'
 import { GLYPH, age, boardOf, boardText, counts, facts, home, idleNote, parseJob, parseSessions, parseWorktrees, plural } from './board.mjs'
@@ -9,14 +9,20 @@ import type { Listed, Reading, Seen, Worktree } from './board.mjs'
 const PANE = 'worktrees'
 // The first read of a transcript starts this far from its end; later reads take only what it gained.
 const FIRST_READ = 1_048_576
+// A change refreshes at once after a quiet spell; while windows keep changing, at most this often.
+const SPACING = 15_000
 const EMPTY: Board = { repo: '', takenAt: 0, worktrees: 0, cards: [], empty: [] }
 const board = atom({ plugin: 'worktree-board', key: 'board' } as const, EMPTY)
 const folds = atom({ plugin: 'worktree-board', key: 'folds' } as const, { idle: false, empty: false })
 const TONE: Record<State, string | undefined> = { 'needs you': 'error', working: 'success', waiting: 'warning', idle: undefined }
 
 const tails = new Map<string, { offset: number; reading: Reading }>()
-let refresh: Timer | undefined
 let inflight: Promise<Board> | undefined
+// The files that change when one of the board's windows does: transcripts, session and job records.
+let watched: string[] = []
+let watching: { files: string; tail: HookStream<ProcessSpawnChunk, ProcessSpawnResult> } | undefined
+let due: Timer | undefined
+let lastAt = 0
 let isInteractive = false
 
 async function physical($: EngineInterface, path: string) {
@@ -61,7 +67,13 @@ async function observe($: EngineInterface, listed: Listed, launch: string, confi
   // A shell whose folder is gone is placed where the window started.
   const place = isMe ? me.cwd : reading.cwd !== undefined && (await $.fs.exists(reading.cwd)) ? await physical($, reading.cwd) : launch
   const seen: Seen = { ...listed, ...reading, needs: typeof job === 'string' ? parseJob(job) : undefined, activeAt: stat?.mtimeMs, place, launch, isMe }
-  return { seen, found: stat !== undefined }
+  const jobFile = listed.jobId === undefined ? undefined : `${config}/jobs/${listed.jobId}/state.json`
+  const files = [
+    stat && transcriptOf(config, listed),
+    listed.pid !== undefined && `${config}/sessions/${listed.pid}.json`,
+    jobFile !== undefined && (await $.fs.exists(jobFile)) && jobFile,
+  ].filter(file => typeof file === 'string')
+  return { seen, found: stat !== undefined, files }
 }
 
 async function worktreeList($: EngineInterface, cwd: string) {
@@ -73,6 +85,7 @@ async function gather($: EngineInterface): Promise<Board> {
   const cwd = await physical($, await $.session.cwd())
   const root = await physical($, await $.session.root())
   const now = await $.clock.now()
+  lastAt = now
   // A shell may have stepped out of the repository; the session's own root has not.
   const porcelain = (await worktreeList($, cwd)) ?? (await worktreeList($, root))
   if (porcelain === undefined) return { ...EMPTY, takenAt: now, note: `${root} is not inside a git repository` }
@@ -88,6 +101,8 @@ async function gather($: EngineInterface): Promise<Board> {
   const observed = await Promise.all(ours.map(({ s, launch }) => observe($, s, launch, config, me, now)))
   const kept = new Set(ours.map(({ s }) => transcriptOf(config, s)))
   for (const path of tails.keys()) if (!kept.has(path)) tails.delete(path)
+  // A failed listing keeps following every window, so their next write retries it.
+  if (listed !== undefined) watched = observed.flatMap(o => o.files)
   const drawn = boardOf(worktrees, observed.map(o => o.seen), now)
   if (listed === undefined) return { ...drawn, note: 'session listing unavailable: `claude agents --json` failed' }
   return observed.length === 0 || observed.some(o => o.found) ? drawn : { ...drawn, note: `no transcripts under ${config}/projects: windows are shown where they started` }
@@ -106,10 +121,45 @@ function refreshBoard($: EngineInterface): Promise<Board> {
   return inflight
 }
 
-function keepFresh($: EngineInterface) {
-  refresh ??= $.clock.every(15_000, () => {
-    void refreshBoard($).catch(() => undefined)
+// Only a drawn pane follows its windows: the editor and the phone show a printed board no refresh reaches.
+function watch($: EngineInterface) {
+  const files = watched.join('\0')
+  if (watched.length === 0 || watching?.files === files) return
+  void watching?.tail.return({ code: null, signal: null })
+  const tail = $.process.spawn({ argv: ['tail', '-q', '-F', '-n', '0', ...watched] })
+  watching = { files, tail }
+  // `-n 0` starts past what changed between the gather's reads and now: one refresh catches up.
+  void changed($)
+  void (async () => {
+    for await (const _ of tail) await changed($)
+  })()
+    .catch(() => undefined)
+    .finally(() => {
+      // A tail that ended or never started is started again by the draw its refresh brings.
+      if (watching?.tail !== tail) return
+      watching = undefined
+      void changed($)
+    })
+}
+
+async function changed($: EngineInterface) {
+  if (due !== undefined) return
+  const wait = Math.max(0, lastAt + SPACING - (await $.clock.now()))
+  due ??= $.clock.after(wait, () => {
+    due = undefined
+    // A gather under way may have read a file before the write that armed this one.
+    void Promise.resolve(inflight)
+      .catch(() => undefined)
+      .then(() => refreshBoard($))
+      .catch(() => undefined)
   })
+}
+
+function unwatch() {
+  void watching?.tail.return({ code: null, signal: null })
+  watching = undefined
+  due?.cancel()
+  due = undefined
 }
 
 function flip($: EngineInterface, fold: keyof Folds) {
@@ -192,6 +242,16 @@ function summaryView(el: ElementTable, shown: Board) {
   )
 }
 
+// Two rows a line the pane draws: summary and section heads, each card's head and windows, the
+// main checkout's idle windows folded to one, the windowless worktrees as one folded card.
+function paneRows(board: Board) {
+  if (board.worktrees === 0) return 2
+  const { main } = board
+  const idle = main?.windows.some(w => w.state === 'idle') ? 1 : 0
+  const cards = board.cards.reduce((n, card) => n + 1 + card.windows.length, 0)
+  return 2 * (6 + cards + (board.empty.length > 0 ? 2 : 0) + (main ? 2 + main.windows.filter(w => w.state !== 'idle').length + idle : 0) + (board.note ? 1 : 0))
+}
+
 function sectionView(el: ElementTable, title: string, note: string) {
   const { Box, Text } = el
   return <Box flexDirection="row" justifyContent="space-between" gap={2} marginBottom={1}><Text bold>{title}</Text><Text dimColor wrap="truncate-end">{note}</Text></Box>
@@ -201,31 +261,28 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     isInteractive = e.isInteractive
     await $.command.register({ name: 'worktrees', description: 'Show where each Claude Code window of this repository works, worktree by worktree' })
-    // A reload drops the timer but keeps the pane open.
-    if ((await $.ui.panes()).some(pane => pane.id === PANE)) {
-      keepFresh($)
-      void refreshBoard($).catch(() => undefined)
-    }
+    // A reload drops the watch but keeps the pane open; its next draw watches again.
+    if ((await $.ui.panes()).some(pane => pane.id === PANE)) void refreshBoard($).catch(() => undefined)
     return next(e)
   })
 
-  on('command.run', { command: 'worktrees' }, async $ => {
+  on('command.run', { command: 'worktrees' }, async ($, e) => {
     const drawn = await refreshBoard($)
-    // Asked inline, the pane opens about as tall as its cards, the windowless worktrees' rows
-    // counted as the one folded card it draws them in; docked, about as wide.
-    const lines = boardText(drawn).split('\n').length - Math.max(0, drawn.empty.length - 1)
-    const opened = await $.ui.open({ id: PANE, title: 'Worktrees', rows: 2 * lines, columns: 64 })
-    if (opened.isPlaced) keepFresh($)
-    return { text: isInteractive && opened.isPlaced && drawn.note === undefined ? summaryLine(drawn) : boardText(drawn) }
+    // Asked inline, the pane opens about as tall as its cards; docked, about as wide.
+    const opened = await $.ui.open({ id: PANE, title: 'Worktrees', rows: paneRows(drawn), columns: 64 })
+    // Asked from the phone or the web, the answer is all that reaches the asker: the pane stays on this machine.
+    const beside = isInteractive && opened.isPlaced && drawn.note === undefined && e.origin.kind !== 'bridge'
+    return { text: beside ? summaryLine(drawn) : boardText(drawn) }
   })
 
   on('ui.close', { id: PANE }, ($, e, next) => {
-    refresh?.cancel()
-    refresh = undefined
+    unwatch()
     return next(e)
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    // Before any await, so a close landing during this draw is never followed by a new watch.
+    watch($)
     const el = $.ui.resolve(e)
     const { Box, Button, Text } = el
     const graphic = e.surface !== 'terminal'

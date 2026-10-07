@@ -18,7 +18,6 @@ import {
 } from './hooks/board.mts'
 
 const MIN = 60_000
-const EM = '\u2003\u2003'
 const NOW = Date.UTC(2026, 0, 10, 12)
 
 const PORCELAIN = `worktree /work/repo
@@ -56,7 +55,7 @@ test('parses the session listing, background sessions by their job', () => {
       { sessionId: 7, cwd: '/work/repo' },
     ])),
     [
-      { id: 'a', name: 'alpha', status: 'busy', cwd: '/work/repo' },
+      { id: 'a', name: 'alpha', status: 'busy', cwd: '/work/repo', pid: 1 },
       { id: 'b', name: 'beta', status: 'blocked', cwd: '/work/repo', jobId: 'c0ffee' },
     ],
   )
@@ -144,39 +143,30 @@ test('puts each window in the worktree its shell is in, and folds the rest', () 
   assert.deepEqual(board.empty.map(c => c.name), ['old', 'new'])
 })
 
-test('writes the board as one Markdown table', () => {
+test('writes the board a line per window, the most urgent first', () => {
   const board = boardOf(worktrees, [
-    seen('alpha', 'busy', '/work/repo/.worktrees/search', { doing: 'Run tests' }),
-    seen('beta', 'idle', '/work/repo', { activeAt: NOW - 2 * 86400_000 }),
+    seen('alpha', 'busy', '/work/repo/.worktrees/search', { doing: 'Run tests', toolTimes: [NOW - MIN, NOW - 40 * MIN] }),
+    seen('beta', 'idle', '/work/repo/.worktrees/search'),
+    seen('gamma', 'blocked', '/work/repo', { needs: 'Ship it?', activeAt: NOW - 20 * MIN }),
+    seen('delta', 'idle', '/work/repo', { activeAt: NOW - 2 * 86400_000 }),
   ], NOW)
-  assert.equal(summaryLine(board), 'repo · 4 worktrees · 1 working · 2 without a window')
-  assert.equal(summaryLine({ ...board, worktrees: 1, empty: [] }), 'repo · 1 worktree · 1 working')
+  assert.equal(summaryLine(board), 'repo · 4 worktrees · 1 needs you · 1 working · 1 waiting · 2 without a window')
+  assert.equal(summaryLine({ ...board, worktrees: 1, empty: [] }), 'repo · 1 worktree · 1 needs you · 1 working · 1 waiting')
   assert.equal(
     boardText(board),
     [
       'repo · 4 worktrees',
       '',
-      '🟢 1 working · ⚪ 2 without a window',
-      '',
-      '| **WORKTREES** | a separate folder and branch for each task |',
-      '| :-- | :-- |',
-      '| **search** | **2 uncommitted · added 3h ago** |',
-      `| ${EM}🟢 **alpha** · working · 2m | Run tests |`,
-      '| **Without a window** | **2 worktrees** |',
-      `| ${EM}⚪ old | 1 uncommitted · 5d |`,
-      `| ${EM}⚪ new | 1m |`,
-      '| **MAIN CHECKOUT** | windows working in the repository folder itself |',
-      '| **repo** | **1 window · branch main** |',
-      `| ${EM}⚪ 1 idle window, oldest 2d |  |`,
+      '- 🔴 **gamma** · asks: Ship it? · 📁 main checkout · 20m',
+      '- 🟢 **alpha** `····▃·········▃` · 📁 search',
+      '- 🟡 **beta** · 2m · 📁 search',
+      '- ⚪ 1 idle window · 2 worktrees without a window',
     ].join('\n'),
   )
   assert.equal(boardText({ ...board, note: 'session listing unavailable' }).split('\n').at(-1), 'session listing unavailable')
-  const unknown = boardOf([worktrees[0], { ...worktrees[2], uncommitted: undefined }], [seen('beta', 'idle', '/work/repo', { activeAt: undefined })], NOW)
-  assert.match(boardText(unknown), /\| \u2003\u2003⚪ old \| status unknown · 5d \|\n.*MAIN CHECKOUT.*\n.*\n\| \u2003\u2003⚪ 1 idle window \| {2}\|$/)
-  const piped = boardOf(worktrees, [seen('a|b', 'busy', '/work/repo', { doing: 'grep a|b' })], NOW)
-  assert.match(boardText(piped), /\| \u2003\u2003🟢 \*\*a\\\|b\*\* · working · 2m \| grep a\\\|b \|/)
-  const broken = boardOf([worktrees[0], { ...worktrees[1], path: '/work/repo/.worktrees/one\nline' }], [seen('a', 'busy', '/work/repo/.worktrees/one\nline')], NOW)
-  assert.match(boardText(broken), /\n\| \*\*one line\*\* \| \*\*feat\/search · 2 uncommitted · added 3h ago\*\* \|\n/)
-  const branched = boardOf([{ ...worktrees[0], branch: 'x|y' }, { ...worktrees[1], branch: 'feat/x|y' }], [seen('a', 'busy', '/work/repo'), seen('b', 'busy', '/work/repo/.worktrees/search')], NOW)
-  assert.match(boardText(branched), /\| \*\*feat\/x\\\|y · 2 uncommitted · added 3h ago\*\* \|\n[^]*\| \*\*1 window · branch x\\\|y\*\* \|/)
+  assert.equal(boardText(boardOf([worktrees[0]], [], NOW)), 'repo · 1 worktree')
+  const quiet = boardOf([worktrees[0], { ...worktrees[1], path: '/work/repo/.worktrees/one\nline' }], [seen('a\nb', 'busy', '/work/repo/.worktrees/one\nline')], NOW)
+  assert.equal(boardText(quiet), 'repo · 2 worktrees\n\n- 🟢 **a b** · 📁 one line')
+  const asking = boardOf([worktrees[0]], [seen('job`1', 'blocked', '/work/repo', { needs: 'Ship `it`?', activeAt: undefined })], NOW)
+  assert.equal(boardText(asking), 'repo · 1 worktree\n\n- 🔴 **job\\`1** · asks: Ship \\`it\\`? · 📁 main checkout')
 })
