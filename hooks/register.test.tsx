@@ -26,7 +26,7 @@ const ok = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isSt
 function machine(on: On) {
   const transcripts: Record<string, string> = {
     [`${DIR}/alpha.jsonl`]: `${JSON.stringify({ type: 'custom-title', customTitle: 'search-1' })}\n${entry('/work/repo/.worktrees/search/lib', NOW - MIN, 'Run tests')}`,
-    [`${DIR}/beta.jsonl`]: entry('/work/repo/.worktrees/search', NOW - 3 * MIN, 'Read the plan'),
+    [`${DIR}/beta.jsonl`]: `${JSON.stringify({ type: 'ai-title', aiTitle: 'Plan review' })}\n${entry('/work/repo/.worktrees/search', NOW - 3 * MIN, 'Read the plan')}`,
     [`${DIR}/gamma.jsonl`]: entry('/work/repo', NOW - 20 * MIN, 'Ask'),
     [`${DIR}/delta.jsonl`]: `${'x'.repeat(MIB + 100)}\n${entry('/work/repo', NOW - 3 * 1440 * MIN)}`,
   }
@@ -88,10 +88,10 @@ test('a window is drawn in the worktree its transcript places it in, and the res
     [
       'repo · 2 worktrees',
       '',
-      '- 🔴 **gamma** · asks: Ship it? · 📁 main checkout · 20m',
+      '- 🔴 **gamma** · background job (`claude agents`) · asks: Ship it? · 📁 main checkout · 20m',
       '- 🟢 **search-1** `··············▃` · 📁 search',
       '- 🟢 **this session** · 📁 main checkout',
-      '- 🟡 **beta** · 2m · 📁 search',
+      '- 🟡 **Plan review** · 2m · 📁 search',
       '- ⚪ 1 idle window',
     ].join('\n'),
   )
@@ -104,6 +104,7 @@ test('a window is drawn in the worktree its transcript places it in, and the res
   const desktop = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(await desktop.findAll({ type: 'Svg' })).toHaveLength(6)
   expect(await desktop.find({ type: 'Text', text: 'search-1' })).toBeDefined()
+  expect(await desktop.find({ type: 'Text', text: 'background job · claude agents · asks: Ship it?' })).toBeDefined()
   expect(await desktop.find({ type: 'Text', text: '3 windows' })).toBeUndefined()
   expect(await desktop.find({ type: 'Text', text: 'delta' })).toBeUndefined()
   await desktop.press({ key: 'idle' })
@@ -238,9 +239,9 @@ test('an interactive session gets one summary line beside a placed pane, the boa
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   await $.session.start({ cwd: '/work/repo', surface: 'terminal', isInteractive: true })
   expect((await $.command.run(RUN)).text).toBe('repo · 2 worktrees · 1 needs you · 2 working · 1 waiting')
-  expect((await $.command.run({ ...RUN, origin: { kind: 'bridge' } })).text).toContain('- 🟡 **beta** · 2m · 📁 search')
+  expect((await $.command.run({ ...RUN, origin: { kind: 'bridge' } })).text).toContain('- 🟡 **Plan review** · 2m · 📁 search')
   pane.isPlaced = false
-  expect((await $.command.run(RUN)).text).toContain('- 🟡 **beta** · 2m · 📁 search')
+  expect((await $.command.run(RUN)).text).toContain('- 🟡 **Plan review** · 2m · 📁 search')
 })
 
 test('three windowless worktrees ask the pane for no more rows than one, as it folds them into one card', async ($, on) => {

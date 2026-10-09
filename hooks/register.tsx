@@ -170,6 +170,7 @@ function flip($: EngineInterface, fold: keyof Folds) {
 function windowView(el: ElementTable, graphic: boolean, w: Window, now: number) {
   const { Box, Text } = el
   const tone = TONE[w.state]
+  const about = [w.isJob && 'background job · claude agents', w.doing].filter(Boolean).join(' · ')
   const bars =
     graphic && 'Svg' in el ? <el.Svg source={pulseSvg(w.pulse, w.state)} alt="tool calls in the last hour" width={96} height={16} /> : <Text color={tone} dimColor={!tone} wrap="truncate-end">{pulseText(w.pulse)}</Text>
   return (
@@ -181,7 +182,7 @@ function windowView(el: ElementTable, graphic: boolean, w: Window, now: number) 
         <Box flexGrow={1} justifyContent="flex-end">{bars}</Box>
         <Box width={4} justifyContent="flex-end"><Text dimColor>{w.activeAt === undefined ? '' : age(now - w.activeAt)}</Text></Box>
       </Box>
-      {w.doing !== undefined && <Box paddingLeft={2}><Text dimColor wrap="truncate-end">{w.doing}</Text></Box>}
+      {about !== '' && <Box paddingLeft={2}><Text dimColor wrap="truncate-end">{about}</Text></Box>}
     </Box>
   )
 }

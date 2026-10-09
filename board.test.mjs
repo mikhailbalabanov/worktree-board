@@ -53,10 +53,14 @@ test('parses the session listing, background sessions by their job', () => {
       { pid: 1, sessionId: 'a', name: 'alpha', cwd: '/work/repo', kind: 'interactive', status: 'busy' },
       { id: 'c0ffee', sessionId: 'b', name: 'beta', cwd: '/work/repo', kind: 'background', state: 'blocked' },
       { sessionId: 7, cwd: '/work/repo' },
+      { pid: 2, id: 'f00d', sessionId: 'c', name: 'gamma', cwd: '/work/repo', kind: 'background', status: 'waiting', state: 'blocked' },
+      { pid: 3, id: 'beef', sessionId: 'd', name: 'delta', cwd: '/work/repo', kind: 'background', status: 'idle', state: 'working' },
     ])),
     [
       { id: 'a', name: 'alpha', status: 'busy', cwd: '/work/repo', pid: 1 },
       { id: 'b', name: 'beta', status: 'blocked', cwd: '/work/repo', jobId: 'c0ffee' },
+      { id: 'c', name: 'gamma', status: 'blocked', cwd: '/work/repo', pid: 2, jobId: 'f00d' },
+      { id: 'd', name: 'delta', status: 'idle', cwd: '/work/repo', pid: 3, jobId: 'beef' },
     ],
   )
   assert.equal(parseSessions('not json'), undefined)
@@ -82,9 +86,11 @@ test('reads whole lines only, counting bytes', () => {
 const line = entry => `${JSON.stringify(entry)}\n`
 const toolUse = (at, name, input, cwd = '/work/repo/.worktrees/search') => line({ type: 'assistant', cwd, timestamp: new Date(at).toISOString(), message: { content: [{ type: 'tool_use', name, input }] } })
 
-test('reads a transcript: newest cwd and title, what it does, its calls in the last hour', () => {
+test('reads a transcript: newest cwd and titles, what it does, its calls in the last hour', () => {
   const first = readTranscript(
     line({ type: 'custom-title', customTitle: 'search-1' }) +
+      line({ type: 'ai-title', aiTitle: 'Search ranking\nfix' }) +
+      line({ type: 'last-prompt', lastPrompt: 'run the tests' }) +
       toolUse(NOW - 90 * MIN, 'Bash', { command: 'ls', description: 'List files' }, '/work/repo') +
       line({ type: 'user', cwd: '/work/repo/.worktrees/search', timestamp: new Date(NOW - 5 * MIN).toISOString() }) +
       toolUse(NOW - 4 * MIN, 'mcp__browser__click', {}) +
@@ -92,12 +98,12 @@ test('reads a transcript: newest cwd and title, what it does, its calls in the l
     { toolTimes: [] },
     NOW,
   )
-  assert.deepEqual(first, { cwd: '/work/repo/.worktrees/search', title: 'search-1', doing: 'browser', toolTimes: [NOW - 4 * MIN] })
+  assert.deepEqual(first, { cwd: '/work/repo/.worktrees/search', title: 'search-1', aiTitle: 'Search ranking', lastPrompt: 'run the tests', doing: 'browser', toolTimes: [NOW - 4 * MIN] })
   assert.equal(readTranscript(toolUse(NOW, 'mcp__tracker__save', { description: 'A long\nissue body' }), { toolTimes: [] }, NOW).doing, 'tracker')
   assert.equal(readTranscript(toolUse(NOW, 'Bash', { description: `Step one\n${'x'.repeat(200)}` }), { toolTimes: [] }, NOW).doing, 'Step one')
   assert.equal(readTranscript(toolUse(NOW, 'Bash', { description: 'y'.repeat(200) }), { toolTimes: [] }, NOW).doing, `${'y'.repeat(119)}…`)
   const next = readTranscript(toolUse(NOW + 30 * MIN, 'Agent', { description: 'Review the diff' }), first, NOW + 61 * MIN)
-  assert.deepEqual(next, { cwd: '/work/repo/.worktrees/search', title: 'search-1', doing: 'Review the diff', toolTimes: [NOW + 30 * MIN] })
+  assert.deepEqual(next, { cwd: '/work/repo/.worktrees/search', title: 'search-1', aiTitle: 'Search ranking', lastPrompt: 'run the tests', doing: 'Review the diff', toolTimes: [NOW + 30 * MIN] })
 })
 
 test('counts calls into thirty two-minute bars and draws them', () => {
@@ -143,6 +149,16 @@ test('puts each window in the worktree its shell is in, and folds the rest', () 
   assert.deepEqual(board.empty.map(c => c.name), ['old', 'new'])
 })
 
+test('names a window as its VS Code tab: its own title, the written one, its last prompt, the listed name', () => {
+  const names = boardOf([worktrees[0]], [
+    seen('a', 'busy', '/work/repo', { title: 'mine', aiTitle: 'written', lastPrompt: 'asked' }),
+    seen('b', 'busy', '/work/repo', { aiTitle: 'written', lastPrompt: 'asked' }),
+    seen('c', 'busy', '/work/repo', { title: '', lastPrompt: 'asked' }),
+    seen('d', 'busy', '/work/repo'),
+  ], NOW).main?.windows.map(w => w.name)
+  assert.deepEqual(names, ['mine', 'written', 'asked', 'd'])
+})
+
 test('writes the board a line per window, the most urgent first', () => {
   const board = boardOf(worktrees, [
     seen('alpha', 'busy', '/work/repo/.worktrees/search', { doing: 'Run tests', toolTimes: [NOW - MIN, NOW - 40 * MIN] }),
@@ -169,4 +185,24 @@ test('writes the board a line per window, the most urgent first', () => {
   assert.equal(boardText(quiet), 'repo · 2 worktrees\n\n- 🟢 **a b** · 📁 one line')
   const asking = boardOf([worktrees[0]], [seen('job`1', 'blocked', '/work/repo', { needs: 'Ship `it`?', activeAt: undefined })], NOW)
   assert.equal(boardText(asking), 'repo · 1 worktree\n\n- 🔴 **job\\`1** · asks: Ship \\`it\\`? · 📁 main checkout')
+})
+
+test('marks a background job as one, and folds a job whose question has waited a day', () => {
+  const jobs = boardOf([worktrees[0]], [
+    seen('asks', 'blocked', '/work/repo', { jobId: 'j1', needs: 'Ship it?', activeAt: NOW - 23 * 60 * MIN }),
+    seen('runs', 'working', '/work/repo', { jobId: 'j2' }),
+    seen('stale', 'blocked', '/work/repo', { jobId: 'j3', needs: 'Ship it?', activeAt: NOW - 24 * 60 * MIN }),
+    seen('quiet', 'idle', '/work/repo', { activeAt: NOW - 2 * 60 * MIN }),
+  ], NOW)
+  assert.equal(summaryLine(jobs), 'repo · 1 worktree · 1 needs you · 1 working')
+  assert.equal(
+    boardText(jobs),
+    [
+      'repo · 1 worktree',
+      '',
+      '- 🔴 **asks** · background job (`claude agents`) · asks: Ship it? · 📁 main checkout · 23h',
+      '- 🟢 **runs** · background job (`claude agents`) · 📁 main checkout',
+      '- ⚪ 1 idle window · 1 idle background job (`claude agents`)',
+    ].join('\n'),
+  )
 })

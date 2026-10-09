@@ -2,12 +2,15 @@ import type { Board, Card, State, Window } from '../types'
 
 export type Worktree = { path: string; branch: string; isMain: boolean; createdAt?: number; uncommitted?: number }
 export type Listed = { id: string; name: string; status: string; cwd: string; pid?: number; jobId?: string }
-export type Reading = { cwd?: string; title?: string; doing?: string; toolTimes: number[] }
+export type Reading = { cwd?: string; title?: string; aiTitle?: string; lastPrompt?: string; doing?: string; toolTimes: number[] }
 export type Seen = {
   id: string
   name: string
   status: string
   title?: string
+  aiTitle?: string
+  lastPrompt?: string
+  jobId?: string
   doing?: string
   needs?: string
   activeAt?: number
@@ -19,6 +22,7 @@ export type Seen = {
 
 const MINUTE = 60_000
 const HOUR = 60 * MINUTE
+const DAY = 24 * HOUR
 const RANK: Record<State, number> = { 'needs you': 0, working: 1, waiting: 2, idle: 3 }
 export const GLYPH: Record<State, string> = { 'needs you': '▲', working: '●', waiting: '●', idle: '○' }
 const COLOR: Record<State, string> = { 'needs you': '#e5534b', working: '#2ea043', waiting: '#d29922', idle: '#8b949e' }
@@ -53,7 +57,8 @@ export function parseSessions(json: string): Listed[] | undefined {
   if (!Array.isArray(rows)) return undefined
   const listed = rows.flatMap(row => {
     if (!isRecord(row) || typeof row.sessionId !== 'string' || typeof row.cwd !== 'string') return []
-    const status = typeof row.status === 'string' ? row.status : typeof row.state === 'string' ? row.state : ''
+    // A live job's `status` is its process; only its `state` says it waits on a reply.
+    const status = row.state === 'blocked' ? 'blocked' : typeof row.status === 'string' ? row.status : typeof row.state === 'string' ? row.state : ''
     const name = typeof row.name === 'string' ? row.name : row.sessionId
     const listed: Listed = { id: row.sessionId, name, status, cwd: row.cwd, ...(typeof row.pid === 'number' && { pid: row.pid }) }
     return [row.kind === 'background' && typeof row.id === 'string' ? { ...listed, jobId: row.id } : listed]
@@ -107,7 +112,7 @@ function describe(tool: string, input: unknown): string {
 // Claude Code stamps every transcript entry with the shell's directory at that
 // moment, so the newest `cwd` is where the session works now, `cd`s included.
 export function readTranscript(text: string, prior: Reading, now: number): Reading {
-  let { cwd, title, doing } = prior
+  let { cwd, title, aiTitle, lastPrompt, doing } = prior
   const toolTimes = prior.toolTimes.filter(at => now - at < HOUR)
   for (const line of text.split('\n')) {
     let entry: unknown
@@ -118,6 +123,8 @@ export function readTranscript(text: string, prior: Reading, now: number): Readi
     }
     if (!isRecord(entry)) continue
     if (entry.type === 'custom-title' && typeof entry.customTitle === 'string') title = oneLine(entry.customTitle)
+    if (entry.type === 'ai-title' && typeof entry.aiTitle === 'string') aiTitle = oneLine(entry.aiTitle)
+    if (entry.type === 'last-prompt' && typeof entry.lastPrompt === 'string') lastPrompt = oneLine(entry.lastPrompt)
     if (typeof entry.cwd === 'string') cwd = entry.cwd
     const content = isRecord(entry.message) ? entry.message.content : undefined
     if (entry.type !== 'assistant' || !Array.isArray(content)) continue
@@ -128,7 +135,7 @@ export function readTranscript(text: string, prior: Reading, now: number): Readi
       if (now - at < HOUR) toolTimes.push(at)
     }
   }
-  return { cwd, title, doing, toolTimes }
+  return { cwd, title, aiTitle, lastPrompt, doing, toolTimes }
 }
 
 export function age(ms: number): string {
@@ -175,14 +182,17 @@ export function ringSvg(count: number, state: State): string {
 
 function stateOf(seen: Seen, now: number): State {
   if (seen.status === 'busy' || seen.status === 'working') return 'working'
-  if (seen.status === 'blocked') return 'needs you'
+  // A question nobody has answered in a day is no longer waited on.
+  if (seen.status === 'blocked') return seen.activeAt !== undefined && now - seen.activeAt >= DAY ? 'idle' : 'needs you'
   return seen.activeAt !== undefined && now - seen.activeAt < HOUR ? 'waiting' : 'idle'
 }
 
 function windowOf(seen: Seen, now: number): Window {
   const state = stateOf(seen, now)
   const doing = seen.isMe ? 'this window' : state === 'needs you' ? `asks: ${seen.needs ?? 'a reply'}` : state === 'working' ? seen.doing : undefined
-  return { id: seen.id, name: seen.title ?? seen.name, state, doing, activeAt: seen.activeAt, pulse: pulse(seen.toolTimes, now) }
+  // Named as VS Code names its tab.
+  const name = seen.title || seen.aiTitle || seen.lastPrompt || seen.name
+  return { id: seen.id, name, state, doing, activeAt: seen.activeAt, pulse: pulse(seen.toolTimes, now), isJob: seen.jobId !== undefined }
 }
 
 // Linked worktrees usually sit inside the main one, so the deepest match wins.
@@ -251,6 +261,7 @@ export function idleNote(card: Card, now: number): string | undefined {
 }
 
 const MARK: Record<State, string> = { 'needs you': '🔴', working: '🟢', waiting: '🟡', idle: '⚪' }
+const AGENTS = '(`claude agents`)'
 // One line each, and a lone backtick cannot pair with a sparkline's code span.
 const line = (text: string) => text.replace(/[\r\n]+/g, ' ').replaceAll('`', '\\`')
 
@@ -267,10 +278,16 @@ export function boardText(board: Board): string {
       const since = w.activeAt === undefined ? undefined : age(now - w.activeAt)
       const bars = w.state === 'working' && w.pulse.some(v => v > 0) ? ` \`${pulseText(w.pulse)}\`` : ''
       const about = w.state === 'needs you' ? [w.doing, folder, since] : w.state === 'working' ? [folder] : [since, folder]
-      return `- ${MARK[w.state]} **${line(w.name)}**${bars} · ${about.flatMap(text => (text ? [line(text)] : [])).join(' · ')}`
+      const job = w.isJob ? ` · background job ${AGENTS}` : ''
+      return `- ${MARK[w.state]} **${line(w.name)}**${bars}${job} · ${about.flatMap(text => (text ? [line(text)] : [])).join(' · ')}`
     })
-  const idle = placed.length - rows.length
-  const folded = [idle > 0 && plural(idle, 'idle window'), board.empty.length > 0 && `${plural(board.empty.length, 'worktree')} without a window`].filter(Boolean)
+  const idle = placed.filter(({ w }) => w.state === 'idle')
+  const jobs = idle.filter(({ w }) => w.isJob).length
+  const folded = [
+    idle.length > jobs && plural(idle.length - jobs, 'idle window'),
+    jobs > 0 && `${plural(jobs, 'idle background job')} ${AGENTS}`,
+    board.empty.length > 0 && `${plural(board.empty.length, 'worktree')} without a window`,
+  ].filter(Boolean)
   if (folded.length > 0) rows.push(`- ⚪ ${folded.join(' · ')}`)
   const out = [[board.repo, plural(board.worktrees, 'worktree')].filter(Boolean).join(' · ')]
   if (rows.length > 0) out.push('', ...rows)

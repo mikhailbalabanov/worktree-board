@@ -1,6 +1,6 @@
 {
   "name": "worktree-board",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Where each Claude Code window of the repository works: the git worktree it is in, what it is doing and its last hour.",
   "author": {
     "name": "Mikhail Balabanov",
